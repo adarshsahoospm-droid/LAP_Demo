@@ -101,12 +101,29 @@ For each document, classify its docType, then read off whichever identity fields
 Then extract whatever identity, banking, KYC/address, and property fields are actually legible across all the documents combined into "extracted". Only report a field if you can actually read it — leave it out rather than guessing. Always respond by calling the extract_documents tool.`;
 }
 
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
+// ALLOWED_ORIGIN: "*" (default) or a comma-separated list of frontend origins.
+// Browsers send the origin without a trailing slash and compare it exactly, so
+// entries are normalised — "https://app.vercel.app/" and "HTTPS://App.vercel.app"
+// both match "https://app.vercel.app" instead of silently blocking every request.
+const normaliseOrigin = o => String(o || "").trim().replace(/\/+$/, "").toLowerCase();
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || "*").split(",").map(normaliseOrigin).filter(Boolean);
+const ALLOW_ANY = ALLOWED_ORIGINS.length === 0 || ALLOWED_ORIGINS.includes("*");
+const warnedOrigins = new Set();
 
 const app = express();
-app.use(express.json({ limit: "40mb" }));
+// CORS headers go on before body parsing, so even a rejected upload (too large,
+// malformed JSON) reaches the browser as a readable error, not "Failed to fetch".
 app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
+  const origin = req.headers.origin;
+  if (ALLOW_ANY) {
+    res.header("Access-Control-Allow-Origin", "*");
+  } else if (origin && ALLOWED_ORIGINS.includes(normaliseOrigin(origin))) {
+    res.header("Access-Control-Allow-Origin", origin);
+    res.header("Vary", "Origin");
+  } else if (origin && !warnedOrigins.has(origin)) {
+    warnedOrigins.add(origin);
+    console.warn(`CORS: blocked request from ${origin}. Allowed: ${ALLOWED_ORIGINS.join(", ")} (set ALLOWED_ORIGIN to include it).`);
+  }
   res.header("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") {
@@ -114,6 +131,18 @@ app.use((req, res, next) => {
     return;
   }
   next();
+});
+app.use(express.json({ limit: "40mb" }));
+app.use((err, req, res, next) => {
+  if (err?.type === "entity.too.large") {
+    res.status(413).json({ error: "Upload too large (max 40 MB per request). Upload fewer or smaller files at a time." });
+    return;
+  }
+  if (err?.type === "entity.parse.failed") {
+    res.status(400).json({ error: "Malformed request body." });
+    return;
+  }
+  next(err);
 });
 
 app.get("/", (req, res) => {
